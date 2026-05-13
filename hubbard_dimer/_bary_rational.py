@@ -31,7 +31,15 @@ import numpy as np
 import scipy
 
 
-__all__ = ["AAA", "AAA_filter", "FloaterHormannInterpolator"]
+__all__ = [
+    "AAA",
+    "AAA_filter",
+    "AAA_adding0",
+    "AAA_holo_interp",
+    "AAA_holo_interp_v2",
+    "AAA_tube",
+    "FloaterHormannInterpolator",
+]
 
 
 class _BarycentricRational:
@@ -1183,7 +1191,7 @@ class AAA_adding0(_BarycentricRational):
                 break
         if np.min(np.abs(final_poles.imag)) < 5*1e-4:
             # print("Cannot find suitable pole-free interpolation, Return naive AAA \n")
-        print("real part of the pole:", np.abs(final_poles.real), "\n")
+            print("real part of the pole:", np.abs(final_poles.real), "\n")
             
         
         # if m == max_terms - 1 and np.min(np.abs(final_poles.imag)) > 1e-4:
@@ -1246,7 +1254,784 @@ class AAA_adding0(_BarycentricRational):
         self._roots = None
 
         return ni
-        
+
+
+class AAA_holo_interp(AAA_adding0):
+    r"""
+    Modified AAA interpolation seeded at the sample point nearest zero.
+
+    This variant follows :class:`AAA_adding0`, but accepts convergence only when the
+    interpolation error is below tolerance and no computed pole has real part in the
+    forbidden interval specified by ``pole_real_window``. If the pole condition fails,
+    it retries up to ``max_trials`` times using a fresh random perturbation of the
+    original function values. If ``perturbation_magnitude`` is not set, the
+    perturbation magnitude defaults to the first failed run's final error. If a full
+    batch of ``max_trials`` perturbations fails, the perturbation magnitude is
+    multiplied by 5 and another batch is attempted.
+    """
+
+    def __init__(self, x, y, *, rtol=None, max_terms=100,
+                 pole_real_window=(0.1, 0.6), max_trials=10,
+                 perturbation_magnitude=None, random_state=None,
+                 clean_up=True, clean_up_tol=1e-13):
+        pole_real_window = self._normalize_pole_real_window(pole_real_window)
+        self._pole_real_window = pole_real_window
+        _BarycentricRational.__init__(
+            self, x, y, rtol=rtol, max_terms=max_terms,
+            pole_real_window=pole_real_window, max_trials=max_trials,
+            perturbation_magnitude=perturbation_magnitude,
+            random_state=random_state
+        )
+
+        if clean_up:
+            self.clean_up(clean_up_tol)
+
+    def _input_validation(self, x, y, rtol=None, max_terms=100,
+                          pole_real_window=(0.1, 0.6), max_trials=10,
+                          perturbation_magnitude=None, random_state=None,
+                          clean_up=True, clean_up_tol=1e-13):
+        max_terms = operator.index(max_terms)
+        if max_terms < 1:
+            raise ValueError("`max_terms` must be an integer value greater than or "
+                             "equal to one.")
+
+        max_trials = operator.index(max_trials)
+        if max_trials < 1:
+            raise ValueError("`max_trials` must be an integer value greater than or "
+                             "equal to one.")
+
+        if y.ndim != 1:
+            raise ValueError("`y` must be 1-D.")
+
+        self._normalize_pole_real_window(pole_real_window)
+        self._normalize_perturbation_magnitude(perturbation_magnitude)
+        _BarycentricRational._input_validation(self, x, y)
+
+    @staticmethod
+    def _normalize_pole_real_window(pole_real_window):
+        if len(pole_real_window) != 2:
+            raise ValueError("`pole_real_window` must contain exactly two values.")
+        lo, hi = pole_real_window
+        lo = float(lo)
+        hi = float(hi)
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            raise ValueError("`pole_real_window` values must be finite.")
+        if lo > hi:
+            raise ValueError("`pole_real_window` must be ordered as (low, high).")
+        return lo, hi
+
+    @staticmethod
+    def _normalize_perturbation_magnitude(perturbation_magnitude):
+        if perturbation_magnitude is None:
+            return None
+        perturbation_magnitude = float(perturbation_magnitude)
+        if not np.isfinite(perturbation_magnitude):
+            raise ValueError("`perturbation_magnitude` must be finite.")
+        if perturbation_magnitude < 0:
+            raise ValueError("`perturbation_magnitude` must be non-negative.")
+        return perturbation_magnitude
+
+    @staticmethod
+    def _compute_poles_from_weights(z, w):
+        B = np.eye(len(w) + 1)
+        B[0, 0] = 0
+        E = np.zeros_like(B, dtype=np.result_type(z, w, 1.0))
+        E[0, 1:] = w
+        E[1:, 0] = 1
+        np.fill_diagonal(E[1:, 1:], z)
+        poles = scipy.linalg.eigvals(E, B)
+        return poles[np.isfinite(poles)]
+
+    def _poles_outside_real_window(self, poles):
+        lo, hi = self._pole_real_window
+        return not np.any((poles.real >= lo) & (poles.real <= hi))
+
+    def _compute_weights(self, z, f, rtol, max_terms, pole_real_window,
+                         max_trials, perturbation_magnitude, random_state):
+        M = np.size(z)
+        max_trials = operator.index(max_trials)
+        if max_trials < 1:
+            raise ValueError("`max_trials` must be an integer value greater than or "
+                             "equal to one.")
+        dtype = np.result_type(z, f, 1.0)
+        real_dtype = np.result_type(f.real, 1.0)
+        rng = np.random.default_rng(random_state)
+        perturbation_magnitude = self._normalize_perturbation_magnitude(
+            perturbation_magnitude
+        )
+
+        rtol = np.finfo(dtype).eps**0.75 if rtol is None else rtol
+        atol = rtol * np.linalg.norm(f, ord=np.inf)
+        f_original = f.copy()
+
+        def _random_perturbation(scale):
+            scale = float(abs(scale))
+            if not np.isfinite(scale) or scale == 0:
+                scale = np.finfo(real_dtype).eps * max(1.0, np.linalg.norm(f, ord=np.inf))
+
+            noise = rng.standard_normal(M)
+            if np.issubdtype(dtype, np.complexfloating):
+                noise = (noise + 1j * rng.standard_normal(M)) / np.sqrt(2)
+
+            noise_norm = np.linalg.norm(noise, ord=np.inf)
+            if noise_norm == 0:
+                return np.zeros(M, dtype=dtype)
+            return (scale * noise / noise_norm).astype(dtype, copy=False)
+
+        def _run_aaa(f_work, target_error):
+            mask = np.ones(M, dtype=np.bool_)
+            zj = np.empty(max_terms, dtype=dtype)
+            fj = np.empty(max_terms, dtype=dtype)
+
+            # Cauchy matrix
+            C = np.empty((M, max_terms), dtype=dtype)
+            # Loewner matrix
+            A = np.empty((M, max_terms), dtype=dtype)
+
+            errors = np.empty(max_terms, dtype=real_dtype)
+
+            # Seed the first support point as argmin |z|.
+            j0 = int(np.argmin(np.abs(z)))
+            zj[0] = z[j0]
+            fj[0] = f_work[j0]
+            mask[j0] = False
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                C[:, 0] = 1 / (z - zj[0])
+            with np.errstate(invalid="ignore"):
+                A[:, 0] = (f_work - fj[0]) * C[:, 0]
+
+            R = np.repeat(np.mean(f_work), M)
+            wj = np.ones(1, dtype=dtype)
+            final_poles = np.empty(0, dtype=dtype)
+            max_error = np.inf
+
+            for m in range(max_terms):
+                if m > 0:
+                    # Select next support point from remaining nodes.
+                    jj = np.argmax(np.abs(f_work[mask] - R[mask]))
+                    zj[m] = z[mask][jj]
+                    fj[m] = f_work[mask][jj]
+
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        C[:, m] = 1 / (z - zj[m])
+
+                    # Map masked-index jj back to global index.
+                    mask[np.nonzero(mask)[0][jj]] = False
+
+                    with np.errstate(invalid="ignore"):
+                        A[:, m] = (f_work - fj[m]) * C[:, m]
+
+                # Compute weights
+                rows = mask.sum()
+                if rows >= m + 1:
+                    _, s, V = scipy.linalg.svd(
+                        A[mask, :m + 1], full_matrices=False, check_finite=False
+                    )
+                    mm = (s == np.min(s))
+                    wj = (V.conj()[mm, :].sum(axis=0) / np.sqrt(mm.sum())).astype(dtype)
+                else:
+                    V = scipy.linalg.null_space(A[mask, :m + 1], check_finite=False)
+                    nm = V.shape[-1]
+                    wj = V.sum(axis=-1) / np.sqrt(nm)
+
+                # Compute rational approximant.
+                i0 = (wj != 0)
+                with np.errstate(invalid="ignore"):
+                    N = C[:, :m + 1][:, i0] @ (wj[i0] * fj[:m + 1][i0])
+                    D = C[:, :m + 1][:, i0] @ wj[i0]
+
+                D_inf = np.isinf(D) | np.isnan(D)
+                D[D_inf] = 1
+                N[D_inf] = f_work[D_inf]
+                R = N / D
+
+                max_error = np.linalg.norm(f_work - R, ord=np.inf)
+                errors[m] = max_error
+
+                zj_temp = zj[:m + 1]
+                fj_temp = fj[:m + 1]
+                i_non_zero = (wj != 0)
+                final_poles = self._compute_poles_from_weights(
+                    zj_temp[i_non_zero], wj[i_non_zero]
+                )
+
+                if max_error <= target_error:
+                    break
+
+            return zj, fj, wj, errors, m, max_error, final_poles, f_work
+
+        target_error = atol
+        retried_with_perturbation = False
+        zj, fj, wj, errors, m, max_error, final_poles, f_fit = _run_aaa(
+            f_original, target_error
+        )
+
+        if not self._poles_outside_real_window(final_poles):
+            perturbation_scale = (
+                max_error if perturbation_magnitude is None
+                else perturbation_magnitude
+            )
+            if not np.isfinite(perturbation_scale) or perturbation_scale == 0:
+                perturbation_scale = (
+                    np.finfo(real_dtype).eps * max(1.0, np.linalg.norm(f, ord=np.inf))
+                )
+            retried_with_perturbation = True
+            total_trials = 0
+
+            while not self._poles_outside_real_window(final_poles):
+                for _ in range(max_trials):
+                    # Each trial is a fresh perturbation of the original data, not a
+                    # cumulative perturbation of the previous trial.
+                    f_trial = f_original + _random_perturbation(perturbation_scale)
+                    zj, fj, wj, errors, m, max_error, final_poles, f_fit = _run_aaa(
+                        f_trial, target_error
+                    )
+                    total_trials += 1
+                    if self._poles_outside_real_window(final_poles):
+                        break
+
+                if self._poles_outside_real_window(final_poles):
+                    break
+
+                perturbation_scale *= 2
+
+        if retried_with_perturbation:
+            print("AAA_holo_interp final max_error:", max_error)
+            print("AAA_holo_interp final target_error:", target_error)
+            print("AAA_holo_interp perturbation_magnitude:", perturbation_scale)
+            print("AAA_holo_interp perturbation_trials:", total_trials)
+            print("AAA_holo_interp accepted a perturbed interpolation")
+
+        # Trim off unused array allocation.
+        zj = zj[:m + 1]
+        fj = fj[:m + 1]
+
+        # Remove support points with zero weight.
+        i_non_zero = (wj != 0)
+        self.errors = errors[:m + 1]
+        self._points = z
+        self._values = f_fit
+        return zj[i_non_zero], fj[i_non_zero], wj[i_non_zero]
+
+
+class AAA_holo_interp_v2(AAA_holo_interp):
+    r"""
+    Modified AAA interpolation with original-data error tracking.
+
+    This variant is the same as :class:`AAA_holo_interp`, except that the AAA
+    iteration error is measured against the original unperturbed function values:
+    ``np.linalg.norm(f_original - R, ord=np.inf)``. Perturbation trials still fit
+    perturbed data, but convergence is judged by the fit to the original data.
+    """
+
+    def _compute_weights(self, z, f, rtol, max_terms, pole_real_window,
+                         max_trials, perturbation_magnitude, random_state):
+        M = np.size(z)
+        max_trials = operator.index(max_trials)
+        if max_trials < 1:
+            raise ValueError("`max_trials` must be an integer value greater than or "
+                             "equal to one.")
+        dtype = np.result_type(z, f, 1.0)
+        real_dtype = np.result_type(f.real, 1.0)
+        rng = np.random.default_rng(random_state)
+        perturbation_magnitude = self._normalize_perturbation_magnitude(
+            perturbation_magnitude
+        )
+
+        rtol = np.finfo(dtype).eps**0.75 if rtol is None else rtol
+        atol = rtol * np.linalg.norm(f, ord=np.inf)
+        f_original = f.copy()
+
+        def _random_perturbation(scale):
+            scale = float(abs(scale))
+            if not np.isfinite(scale) or scale == 0:
+                scale = np.finfo(real_dtype).eps * max(
+                    1.0, np.linalg.norm(f_original, ord=np.inf)
+                )
+
+            noise = rng.standard_normal(M)
+            if np.issubdtype(dtype, np.complexfloating):
+                noise = (noise + 1j * rng.standard_normal(M)) / np.sqrt(2)
+
+            noise_norm = np.linalg.norm(noise, ord=np.inf)
+            if noise_norm == 0:
+                return np.zeros(M, dtype=dtype)
+            return (scale * noise / noise_norm).astype(dtype, copy=False)
+
+        def _run_aaa(f_work, target_error):
+            mask = np.ones(M, dtype=np.bool_)
+            zj = np.empty(max_terms, dtype=dtype)
+            fj = np.empty(max_terms, dtype=dtype)
+
+            # Cauchy matrix
+            C = np.empty((M, max_terms), dtype=dtype)
+            # Loewner matrix
+            A = np.empty((M, max_terms), dtype=dtype)
+
+            errors = np.empty(max_terms, dtype=real_dtype)
+
+            # Seed the first support point as argmin |z|.
+            j0 = int(np.argmin(np.abs(z)))
+            zj[0] = z[j0]
+            fj[0] = f_work[j0]
+            mask[j0] = False
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                C[:, 0] = 1 / (z - zj[0])
+            with np.errstate(invalid="ignore"):
+                A[:, 0] = (f_work - fj[0]) * C[:, 0]
+
+            R = np.repeat(np.mean(f_work), M)
+            wj = np.ones(1, dtype=dtype)
+            final_poles = np.empty(0, dtype=dtype)
+            max_error = np.inf
+
+            for m in range(max_terms):
+                if m > 0:
+                    # Select next support point from remaining nodes.
+                    jj = np.argmax(np.abs(f_work[mask] - R[mask]))
+                    zj[m] = z[mask][jj]
+                    fj[m] = f_work[mask][jj]
+
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        C[:, m] = 1 / (z - zj[m])
+
+                    # Map masked-index jj back to global index.
+                    mask[np.nonzero(mask)[0][jj]] = False
+
+                    with np.errstate(invalid="ignore"):
+                        A[:, m] = (f_work - fj[m]) * C[:, m]
+
+                # Compute weights
+                rows = mask.sum()
+                if rows >= m + 1:
+                    _, s, V = scipy.linalg.svd(
+                        A[mask, :m + 1], full_matrices=False, check_finite=False
+                    )
+                    mm = (s == np.min(s))
+                    wj = (V.conj()[mm, :].sum(axis=0) / np.sqrt(mm.sum())).astype(dtype)
+                else:
+                    V = scipy.linalg.null_space(A[mask, :m + 1], check_finite=False)
+                    nm = V.shape[-1]
+                    wj = V.sum(axis=-1) / np.sqrt(nm)
+
+                # Compute rational approximant.
+                i0 = (wj != 0)
+                with np.errstate(invalid="ignore"):
+                    N = C[:, :m + 1][:, i0] @ (wj[i0] * fj[:m + 1][i0])
+                    D = C[:, :m + 1][:, i0] @ wj[i0]
+
+                D_inf = np.isinf(D) | np.isnan(D)
+                D[D_inf] = 1
+                N[D_inf] = f_work[D_inf]
+                R = N / D
+
+                max_error = np.linalg.norm(f_original - R, ord=np.inf)
+                errors[m] = max_error
+
+                zj_temp = zj[:m + 1]
+                fj_temp = fj[:m + 1]
+                i_non_zero = (wj != 0)
+                final_poles = self._compute_poles_from_weights(
+                    zj_temp[i_non_zero], wj[i_non_zero]
+                )
+
+                if max_error <= target_error:
+                    break
+
+            return zj, fj, wj, errors, m, max_error, final_poles, f_work
+
+        target_error = atol
+        retried_with_perturbation = False
+        zj, fj, wj, errors, m, max_error, final_poles, f_fit = _run_aaa(
+            f_original, target_error
+        )
+
+        def _accepted(error, poles):
+            return error <= target_error and self._poles_outside_real_window(poles)
+
+        if not _accepted(max_error, final_poles):
+            perturbation_scale = (
+                max_error if perturbation_magnitude is None
+                else perturbation_magnitude
+            )
+            if not np.isfinite(perturbation_scale) or perturbation_scale == 0:
+                perturbation_scale = (
+                    np.finfo(real_dtype).eps
+                    * max(1.0, np.linalg.norm(f_original, ord=np.inf))
+                )
+            retried_with_perturbation = True
+            total_trials = 0
+
+            while not _accepted(max_error, final_poles):
+                for _ in range(max_trials):
+                    # Each trial is a fresh perturbation of the original data, not a
+                    # cumulative perturbation of the previous trial.
+                    f_trial = f_original + _random_perturbation(perturbation_scale)
+                    zj, fj, wj, errors, m, max_error, final_poles, f_fit = _run_aaa(
+                        f_trial, target_error
+                    )
+                    total_trials += 1
+                    if _accepted(max_error, final_poles):
+                        break
+
+                if _accepted(max_error, final_poles):
+                    break
+
+                perturbation_scale *= 10
+                print("AAA_holo_interp_v2 trying perturbation scale:", perturbation_scale)
+
+        if retried_with_perturbation:
+            print("AAA_holo_interp_v2 final max_error:", max_error)
+            print("AAA_holo_interp_v2 final target_error:", target_error)
+            print("AAA_holo_interp_v2 perturbation_magnitude:", perturbation_scale)
+            print("AAA_holo_interp_v2 perturbation_trials:", total_trials)
+            print("AAA_holo_interp_v2 accepted a perturbed interpolation")
+
+        # Trim off unused array allocation.
+        zj = zj[:m + 1]
+        fj = fj[:m + 1]
+
+        # Remove support points with zero weight.
+        i_non_zero = (wj != 0)
+        self.errors = errors[:m + 1]
+        self._points = z
+        self._values = f_fit
+        return zj[i_non_zero], fj[i_non_zero], wj[i_non_zero]
+
+
+class AAA_tube(AAA_adding0):
+    r"""
+    AAA interpolation constrained by a pole-free complex tube.
+
+    This variant follows :class:`AAA_adding0`, but accepts convergence only when:
+
+    1. the AAA interpolation error is below tolerance,
+    2. no computed pole lies inside the delta tube around the real interval covered
+       by the sample points, and
+    3. the interpolant has modulus less than one on ``Ns`` sampled boundary points
+       of that tube.
+
+    The tube is the stadium-shaped region around ``tube_real_window``:
+    a rectangle ``lo <= real(z) <= hi, |imag(z)| <= delta`` plus semicircular caps of
+    radius ``delta`` at ``lo`` and ``hi``. If ``tube_real_window`` is not supplied,
+    the interval defaults to ``[min(real(x)), max(real(x))]``.
+    """
+
+    def __init__(self, x, y, *, delta, Ns=100, rtol=None, max_terms=100,
+                 tube_real_window=None, clean_up=False, clean_up_tol=1e-13):
+        self._tube_delta = self._normalize_delta(delta)
+        self._tube_Ns = self._normalize_Ns(Ns)
+        self._tube_real_window = self._normalize_tube_real_window(tube_real_window)
+        _BarycentricRational.__init__(
+            self, x, y, delta=self._tube_delta, Ns=self._tube_Ns,
+            rtol=rtol, max_terms=max_terms,
+            tube_real_window=self._tube_real_window,
+        )
+
+        if clean_up:
+            self.clean_up(clean_up_tol)
+
+    def _input_validation(self, x, y, delta, Ns=100, rtol=None, max_terms=100,
+                          tube_real_window=None, clean_up=False, clean_up_tol=1e-13):
+        max_terms = operator.index(max_terms)
+        if max_terms < 1:
+            raise ValueError("`max_terms` must be an integer value greater than or "
+                             "equal to one.")
+
+        if y.ndim != 1:
+            raise ValueError("`y` must be 1-D.")
+
+        self._normalize_delta(delta)
+        self._normalize_Ns(Ns)
+        self._normalize_tube_real_window(tube_real_window)
+        _BarycentricRational._input_validation(self, x, y)
+
+    @staticmethod
+    def _normalize_delta(delta):
+        delta = float(delta)
+        if not np.isfinite(delta):
+            raise ValueError("`delta` must be finite.")
+        if delta <= 0:
+            raise ValueError("`delta` must be positive.")
+        return delta
+
+    @staticmethod
+    def _normalize_Ns(Ns):
+        Ns = operator.index(Ns)
+        if Ns < 4:
+            raise ValueError("`Ns` must be an integer value greater than or equal to 4.")
+        return Ns
+
+    @staticmethod
+    def _normalize_tube_real_window(tube_real_window):
+        if tube_real_window is None:
+            return None
+        if len(tube_real_window) != 2:
+            raise ValueError("`tube_real_window` must contain exactly two values.")
+        lo, hi = tube_real_window
+        lo = float(lo)
+        hi = float(hi)
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            raise ValueError("`tube_real_window` values must be finite.")
+        if lo > hi:
+            raise ValueError("`tube_real_window` must be ordered as (low, high).")
+        return lo, hi
+
+    @staticmethod
+    def _compute_poles_from_weights(z, w):
+        B = np.eye(len(w) + 1)
+        B[0, 0] = 0
+        E = np.zeros_like(B, dtype=np.result_type(z, w, 1.0))
+        E[0, 1:] = w
+        E[1:, 0] = 1
+        np.fill_diagonal(E[1:, 1:], z)
+        poles = scipy.linalg.eigvals(E, B)
+        return poles[np.isfinite(poles)]
+
+    @staticmethod
+    def _tube_boundary_points(lo, hi, delta, Ns):
+        if np.isclose(lo, hi):
+            theta = np.linspace(0, 2 * np.pi, Ns, endpoint=False)
+            return lo + delta * np.exp(1j * theta)
+
+        n_upper = max(2, Ns // 4)
+        n_right = max(2, Ns // 4)
+        n_lower = max(2, Ns // 4)
+        n_left = max(2, Ns - n_upper - n_right - n_lower)
+
+        upper = np.linspace(lo, hi, n_upper, endpoint=False) + 1j * delta
+        theta_right = np.linspace(np.pi / 2, -np.pi / 2, n_right, endpoint=False)
+        right_cap = hi + delta * np.exp(1j * theta_right)
+        lower = np.linspace(hi, lo, n_lower, endpoint=False) - 1j * delta
+        theta_left = np.linspace(-np.pi / 2, np.pi / 2, n_left, endpoint=False)
+        left_cap = lo + delta * np.exp(1j * theta_left)
+        return np.concatenate([upper, right_cap, lower, left_cap])
+
+    @staticmethod
+    def _poles_inside_tube(poles, lo, hi, delta):
+        if poles.size == 0:
+            return np.zeros(0, dtype=bool)
+
+        real_part = poles.real
+        imag_abs = np.abs(poles.imag)
+
+        in_strip = (real_part >= lo) & (real_part <= hi) & (imag_abs <= delta)
+        left_cap = np.abs(poles - lo) <= delta
+        right_cap = np.abs(poles - hi) <= delta
+
+        return in_strip | left_cap | right_cap
+
+    @classmethod
+    def _poles_outside_tube(cls, poles, lo, hi, delta):
+        return not np.any(cls._poles_inside_tube(poles, lo, hi, delta))
+
+    @staticmethod
+    def _evaluate_barycentric(z_eval, support_points, support_values, weights):
+        z_eval = np.asarray(z_eval)
+        zv = np.ravel(z_eval)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            C = 1 / np.subtract.outer(zv, support_points)
+            r = C @ (weights * support_values) / (C @ weights)
+
+        ii = np.nonzero(np.isnan(r))[0]
+        for jj in ii:
+            if np.isnan(zv[jj]) or not np.any(zv[jj] == support_points):
+                continue
+            r[jj] = support_values[zv[jj] == support_points].squeeze()
+
+        return np.reshape(r, z_eval.shape)
+
+    def _compute_weights(self, z, f, delta, Ns, rtol, max_terms, tube_real_window):
+        M = np.size(z)
+        mask = np.ones(M, dtype=np.bool_)
+        dtype = np.result_type(z, f, 1.0)
+        real_dtype = np.result_type(f.real, 1.0)
+
+        rtol = np.finfo(dtype).eps**0.75 if rtol is None else rtol
+        atol = rtol * np.linalg.norm(f, ord=np.inf)
+
+        if tube_real_window is None:
+            tube_lo = float(np.min(np.real(z)))
+            tube_hi = float(np.max(np.real(z)))
+        else:
+            tube_lo, tube_hi = tube_real_window
+        boundary_points = self._tube_boundary_points(tube_lo, tube_hi, delta, Ns)
+
+        zj = np.empty(max_terms, dtype=dtype)
+        fj = np.empty(max_terms, dtype=dtype)
+
+        # Cauchy matrix
+        C = np.empty((M, max_terms), dtype=dtype)
+        # Loewner matrix
+        A = np.empty((M, max_terms), dtype=dtype)
+        errors = np.empty(max_terms, dtype=real_dtype)
+
+        # Seed the first support point as argmin |z|.
+        j0 = int(np.argmin(np.abs(z)))
+        zj[0] = z[j0]
+        fj[0] = f[j0]
+        mask[j0] = False
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            C[:, 0] = 1 / (z - zj[0])
+        with np.errstate(invalid="ignore"):
+            A[:, 0] = (f - fj[0]) * C[:, 0]
+
+        R = np.repeat(np.mean(f), M)
+        wj = np.ones(1, dtype=dtype)
+        final_poles = np.empty(0, dtype=dtype)
+        boundary_max = np.inf
+        best_valid = None
+
+        for m in range(max_terms):
+            if m > 0:
+                # Select next support point from remaining nodes.
+                jj = np.argmax(np.abs(f[mask] - R[mask]))
+                zj[m] = z[mask][jj]
+                fj[m] = f[mask][jj]
+
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    C[:, m] = 1 / (z - zj[m])
+
+                # Map masked-index jj back to global index.
+                mask[np.nonzero(mask)[0][jj]] = False
+
+                with np.errstate(invalid="ignore"):
+                    A[:, m] = (f - fj[m]) * C[:, m]
+
+            # Compute weights
+            rows = mask.sum()
+            if rows >= m + 1:
+                _, s, V = scipy.linalg.svd(
+                    A[mask, :m + 1], full_matrices=False, check_finite=False
+                )
+                mm = (s == np.min(s))
+                wj = (V.conj()[mm, :].sum(axis=0) / np.sqrt(mm.sum())).astype(dtype)
+            else:
+                V = scipy.linalg.null_space(A[mask, :m + 1], check_finite=False)
+                nm = V.shape[-1]
+                wj = V.sum(axis=-1) / np.sqrt(nm)
+
+            i0 = (wj != 0)
+            with np.errstate(invalid="ignore"):
+                N = C[:, :m + 1][:, i0] @ (wj[i0] * fj[:m + 1][i0])
+                D = C[:, :m + 1][:, i0] @ wj[i0]
+
+            D_inf = np.isinf(D) | np.isnan(D)
+            D[D_inf] = 1
+            N[D_inf] = f[D_inf]
+            R = N / D
+
+            max_error = np.linalg.norm(f - R, ord=np.inf)
+            errors[m] = max_error
+
+            zj_temp = zj[:m + 1]
+            fj_temp = fj[:m + 1]
+            i_non_zero = (wj != 0)
+            support_points = zj_temp[i_non_zero]
+            support_values = fj_temp[i_non_zero]
+            weights = wj[i_non_zero]
+
+            final_poles = self._compute_poles_from_weights(support_points, weights)
+            boundary_values = self._evaluate_barycentric(
+                boundary_points, support_points, support_values, weights
+            )
+            boundary_max = np.linalg.norm(boundary_values, ord=np.inf)
+            pole_ok = self._poles_outside_tube(final_poles, tube_lo, tube_hi, delta)
+            boundary_ok = np.isfinite(boundary_max) and boundary_max < 1
+
+            if pole_ok and boundary_ok:
+                if best_valid is None or max_error < best_valid[5]:
+                    best_valid = (
+                        m,
+                        zj[:m + 1].copy(),
+                        fj[:m + 1].copy(),
+                        wj.copy(),
+                        errors[:m + 1].copy(),
+                        max_error,
+                        final_poles.copy(),
+                        boundary_max,
+                    )
+
+            if (
+                max_error <= atol
+                and pole_ok
+                and boundary_ok
+            ):
+                break
+
+        final_ok = (
+            max_error <= atol
+            and self._poles_outside_tube(final_poles, tube_lo, tube_hi, delta)
+            and np.isfinite(boundary_max)
+            and boundary_max < 1
+        )
+        if not final_ok and best_valid is not None:
+            (
+                m,
+                zj,
+                fj,
+                wj,
+                valid_errors,
+                max_error,
+                final_poles,
+                boundary_max,
+            ) = best_valid
+            errors[:m + 1] = valid_errors
+            print("AAA_tube using best tube-safe iterate before max_terms.")
+
+        inside_tube_mask = self._poles_inside_tube(final_poles, tube_lo, tube_hi, delta)
+        no_tube_safe_iterate = (
+            np.any(inside_tube_mask)
+            or not np.isfinite(boundary_max)
+            or boundary_max >= 1
+        )
+        if not (
+            max_error <= atol
+            and self._poles_outside_tube(final_poles, tube_lo, tube_hi, delta)
+            and np.isfinite(boundary_max)
+            and boundary_max < 1
+        ):
+            warnings.warn(
+                "AAA_tube failed to satisfy all constraints within "
+                f"{max_terms} iterations.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            if no_tube_safe_iterate:
+                print(
+                    "AAA_tube warning: could not find an interpolation with poles "
+                    "outside the delta tube and boundary max < 1."
+                )
+                print("AAA_tube warning tube real interval:", (tube_lo, tube_hi))
+                print("AAA_tube warning tube delta:", delta)
+                print("AAA_tube warning final poles:", final_poles)
+                print("AAA_tube warning poles inside tube:", final_poles[inside_tube_mask])
+                print("AAA_tube warning maximum boundary |r(z)|:", boundary_max)
+
+        print("AAA_tube final poles:", final_poles)
+        print("AAA_tube tube real interval:", (tube_lo, tube_hi))
+        print("AAA_tube tube delta:", delta)
+        print("AAA_tube poles inside tube:", final_poles[inside_tube_mask])
+        print("AAA_tube maximum boundary |r(z)|:", boundary_max)
+
+        # Trim off unused array allocation.
+        zj = zj[:m + 1]
+        fj = fj[:m + 1]
+
+        # Remove support points with zero weight.
+        i_non_zero = (wj != 0)
+        self.errors = errors[:m + 1]
+        self._points = z
+        self._values = f
+        self._tube_boundary_points_used = boundary_points
+        self._tube_boundary_max = boundary_max
+        self._tube_poles = final_poles
+        return zj[i_non_zero], fj[i_non_zero], wj[i_non_zero]
+
 class FloaterHormannInterpolator(_BarycentricRational):
     r"""
     Floater-Hormann barycentric rational interpolation.
