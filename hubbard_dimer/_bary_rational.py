@@ -38,6 +38,7 @@ __all__ = [
     "AAA_holo_interp",
     "AAA_holo_interp_v2",
     "AAA_tube",
+    "AAA_tube_v2",
     "FloaterHormannInterpolator",
 ]
 
@@ -1850,8 +1851,9 @@ class AAA_tube(AAA_adding0):
         dtype = np.result_type(z, f, 1.0)
         real_dtype = np.result_type(f.real, 1.0)
 
-        rtol = np.finfo(dtype).eps**0.75 if rtol is None else rtol
-        atol = rtol * np.linalg.norm(f, ord=np.inf)
+        atol = np.finfo(dtype).eps**0.75 * np.linalg.norm(f, ord=np.inf)
+        if rtol is not None:
+            atol = rtol
 
         if tube_real_window is None:
             tube_lo = float(np.min(np.real(z)))
@@ -1989,18 +1991,22 @@ class AAA_tube(AAA_adding0):
             or not np.isfinite(boundary_max)
             or boundary_max >= 1
         )
-        if not (
-            max_error <= atol
-            and self._poles_outside_tube(final_poles, tube_lo, tube_hi, delta)
-            and np.isfinite(boundary_max)
-            and boundary_max < 1
-        ):
+        error_ok = max_error <= atol
+        pole_ok = self._poles_outside_tube(final_poles, tube_lo, tube_hi, delta)
+        boundary_ok = np.isfinite(boundary_max) and boundary_max < 1
+        if not (error_ok and pole_ok and boundary_ok):
             warnings.warn(
                 "AAA_tube failed to satisfy all constraints within "
                 f"{max_terms} iterations.",
                 RuntimeWarning,
                 stacklevel=2,
             )
+            print("AAA_tube warning constraints satisfied:")
+            print("  max_error <= target:", error_ok)
+            print("  poles outside tube:", pole_ok)
+            print("  boundary max < 1:", boundary_ok)
+            print("AAA_tube warning final max_error:", max_error)
+            print("AAA_tube warning target max_error:", atol)
             if no_tube_safe_iterate:
                 print(
                     "AAA_tube warning: could not find an interpolation with poles "
@@ -2017,6 +2023,8 @@ class AAA_tube(AAA_adding0):
         print("AAA_tube tube delta:", delta)
         print("AAA_tube poles inside tube:", final_poles[inside_tube_mask])
         print("AAA_tube maximum boundary |r(z)|:", boundary_max)
+        print("AAA_tube final max_error:", max_error)
+        print("AAA_tube target max_error:", atol)
 
         # Trim off unused array allocation.
         zj = zj[:m + 1]
@@ -2030,7 +2038,300 @@ class AAA_tube(AAA_adding0):
         self._tube_boundary_points_used = boundary_points
         self._tube_boundary_max = boundary_max
         self._tube_poles = final_poles
+        self._tube_max_error = max_error
+        self._tube_target_error = atol
         return zj[i_non_zero], fj[i_non_zero], wj[i_non_zero]
+
+
+class AAA_tube_v2(AAA_tube):
+    r"""
+    AAA_tube variant with pole-aware greedy support-point selection.
+
+    At each AAA step, candidates are considered in descending order of current
+    residual ``abs(f - R)``. The first candidate whose tentative rational
+    approximant has no poles inside the tube is accepted. If no candidate is
+    pole-safe, the largest-residual candidate is used as a fallback and the
+    iteration continues.
+    """
+
+    def _compute_weights(self, z, f, delta, Ns, rtol, max_terms, tube_real_window):
+        M = np.size(z)
+        mask = np.ones(M, dtype=np.bool_)
+        dtype = np.result_type(z, f, 1.0)
+        real_dtype = np.result_type(f.real, 1.0)
+
+        atol = np.finfo(dtype).eps**0.75 * np.linalg.norm(f, ord=np.inf)
+        if rtol is not None:
+            atol = rtol
+
+        if tube_real_window is None:
+            tube_lo = float(np.min(np.real(z)))
+            tube_hi = float(np.max(np.real(z)))
+        else:
+            tube_lo, tube_hi = tube_real_window
+        boundary_points = self._tube_boundary_points(tube_lo, tube_hi, delta, Ns)
+
+        zj = np.empty(max_terms, dtype=dtype)
+        fj = np.empty(max_terms, dtype=dtype)
+        C = np.empty((M, max_terms), dtype=dtype)
+        A = np.empty((M, max_terms), dtype=dtype)
+        errors = np.empty(max_terms, dtype=real_dtype)
+
+        j0 = int(np.argmin(np.abs(z)))
+        zj[0] = z[j0]
+        fj[0] = f[j0]
+        mask[j0] = False
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            C[:, 0] = 1 / (z - zj[0])
+        with np.errstate(invalid="ignore"):
+            A[:, 0] = (f - fj[0]) * C[:, 0]
+
+        R = np.repeat(np.mean(f), M)
+        wj = np.ones(1, dtype=dtype)
+        final_poles = np.empty(0, dtype=dtype)
+        boundary_max = np.inf
+        best_valid = None
+        fallback_count = 0
+
+        for m in range(max_terms):
+            if m > 0:
+                (
+                    selected_idx,
+                    selected_C_col,
+                    selected_A_col,
+                    selected_wj,
+                    selected_R,
+                    selected_max_error,
+                    selected_poles,
+                    selected_boundary_max,
+                    selected_pole_ok,
+                ) = self._select_tube_safe_candidate(
+                    z, f, R, mask, C, A, zj, fj, m, tube_lo, tube_hi, delta,
+                    boundary_points, dtype,
+                )
+
+                zj[m] = z[selected_idx]
+                fj[m] = f[selected_idx]
+                C[:, m] = selected_C_col
+                A[:, m] = selected_A_col
+                mask[selected_idx] = False
+                wj = selected_wj
+                R = selected_R
+                max_error = selected_max_error
+                final_poles = selected_poles
+                boundary_max = selected_boundary_max
+
+                if not selected_pole_ok:
+                    fallback_count += 1
+                    print(
+                        "AAA_tube_v2 warning: no candidate support point kept "
+                        "tentative poles outside the tube at iteration",
+                        m,
+                    )
+
+            else:
+                wj, R, max_error, final_poles, boundary_max = (
+                    self._evaluate_candidate_state(
+                        z, f, C[:, :m + 1], A[:, :m + 1], mask,
+                        zj[:m + 1], fj[:m + 1], tube_lo, tube_hi, delta,
+                        boundary_points, dtype,
+                    )
+                )
+
+            errors[m] = max_error
+            pole_ok = self._poles_outside_tube(final_poles, tube_lo, tube_hi, delta)
+            boundary_ok = np.isfinite(boundary_max) and boundary_max < 1
+            print(
+                f"AAA_tube_v2 iteration {m} max_error: {max_error} "
+                f"target: {atol} pole_ok: {pole_ok} "
+                f"boundary_ok: {boundary_ok} boundary_max: {boundary_max}"
+            )
+
+            if pole_ok and boundary_ok:
+                if best_valid is None or max_error < best_valid[5]:
+                    best_valid = (
+                        m,
+                        zj[:m + 1].copy(),
+                        fj[:m + 1].copy(),
+                        wj.copy(),
+                        errors[:m + 1].copy(),
+                        max_error,
+                        final_poles.copy(),
+                        boundary_max,
+                    )
+
+            if max_error <= atol and pole_ok and boundary_ok:
+                break
+
+        final_ok = (
+            max_error <= atol
+            and self._poles_outside_tube(final_poles, tube_lo, tube_hi, delta)
+            and np.isfinite(boundary_max)
+            and boundary_max < 1
+        )
+        if not final_ok and best_valid is not None:
+            (
+                m,
+                zj,
+                fj,
+                wj,
+                valid_errors,
+                max_error,
+                final_poles,
+                boundary_max,
+            ) = best_valid
+            errors[:m + 1] = valid_errors
+            print("AAA_tube_v2 using best tube-safe iterate before max_terms.")
+
+        inside_tube_mask = self._poles_inside_tube(final_poles, tube_lo, tube_hi, delta)
+        error_ok = max_error <= atol
+        pole_ok = self._poles_outside_tube(final_poles, tube_lo, tube_hi, delta)
+        boundary_ok = np.isfinite(boundary_max) and boundary_max < 1
+        if not (error_ok and pole_ok and boundary_ok):
+            warnings.warn(
+                "AAA_tube_v2 failed to satisfy all constraints within "
+                f"{max_terms} iterations.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            print("AAA_tube_v2 warning constraints satisfied:")
+            print("  max_error <= target:", error_ok)
+            print("  poles outside tube:", pole_ok)
+            print("  boundary max < 1:", boundary_ok)
+            print("AAA_tube_v2 warning final max_error:", max_error)
+            print("AAA_tube_v2 warning target max_error:", atol)
+
+        print("AAA_tube_v2 final poles:", final_poles)
+        print("AAA_tube_v2 tube real interval:", (tube_lo, tube_hi))
+        print("AAA_tube_v2 tube delta:", delta)
+        print("AAA_tube_v2 poles inside tube:", final_poles[inside_tube_mask])
+        print("AAA_tube_v2 maximum boundary |r(z)|:", boundary_max)
+        print("AAA_tube_v2 final max_error:", max_error)
+        print("AAA_tube_v2 target max_error:", atol)
+        print("AAA_tube_v2 fallback candidate count:", fallback_count)
+
+        zj = zj[:m + 1]
+        fj = fj[:m + 1]
+        i_non_zero = (wj != 0)
+        self.errors = errors[:m + 1]
+        self._points = z
+        self._values = f
+        self._tube_boundary_points_used = boundary_points
+        self._tube_boundary_max = boundary_max
+        self._tube_poles = final_poles
+        self._tube_max_error = max_error
+        self._tube_target_error = atol
+        self._tube_v2_fallback_count = fallback_count
+        return zj[i_non_zero], fj[i_non_zero], wj[i_non_zero]
+
+    def _select_tube_safe_candidate(
+        self, z, f, R, mask, C, A, zj, fj, m, tube_lo, tube_hi, delta,
+        boundary_points, dtype,
+    ):
+        active_indices = np.nonzero(mask)[0]
+        residual_order = np.argsort(-np.abs(f[active_indices] - R[active_indices]))
+        ordered_indices = active_indices[residual_order]
+
+        fallback = None
+        for global_idx in ordered_indices:
+            state = self._trial_candidate_state(
+                z, f, mask, C, A, zj, fj, m, global_idx, tube_lo, tube_hi,
+                delta, boundary_points, dtype,
+            )
+            pole_ok = state[-1]
+            if fallback is None:
+                fallback = state
+            if pole_ok:
+                return state
+
+        return fallback
+
+    def _trial_candidate_state(
+        self, z, f, mask, C, A, current_zj, current_fj, m, global_idx, tube_lo, tube_hi,
+        delta, boundary_points, dtype,
+    ):
+        candidate_z = z[global_idx]
+        candidate_f = f[global_idx]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            C_col = 1 / (z - candidate_z)
+        with np.errstate(invalid="ignore"):
+            A_col = (f - candidate_f) * C_col
+
+        trial_C = C[:, :m + 1].copy()
+        trial_A = A[:, :m + 1].copy()
+        trial_C[:, m] = C_col
+        trial_A[:, m] = A_col
+
+        trial_mask = mask.copy()
+        trial_mask[global_idx] = False
+        trial_zj = np.empty(m + 1, dtype=dtype)
+        trial_fj = np.empty(m + 1, dtype=dtype)
+        trial_zj[:m] = current_zj[:m]
+        trial_fj[:m] = current_fj[:m]
+        trial_zj[m] = candidate_z
+        trial_fj[m] = candidate_f
+
+        wj, R, max_error, poles, boundary_max = self._evaluate_candidate_state(
+            z, f, trial_C, trial_A, trial_mask, trial_zj, trial_fj,
+            tube_lo, tube_hi, delta, boundary_points, dtype,
+        )
+        pole_ok = self._poles_outside_tube(poles, tube_lo, tube_hi, delta)
+
+        return (
+            global_idx,
+            C_col,
+            A_col,
+            wj,
+            R,
+            max_error,
+            poles,
+            boundary_max,
+            pole_ok,
+        )
+
+    def _evaluate_candidate_state(
+        self, z, f, C_block, A_block, mask, zj, fj, tube_lo, tube_hi,
+        delta, boundary_points, dtype,
+    ):
+        m_plus_one = A_block.shape[1]
+        rows = mask.sum()
+        if rows >= m_plus_one:
+            _, s, V = scipy.linalg.svd(
+                A_block[mask, :m_plus_one], full_matrices=False,
+                check_finite=False,
+            )
+            mm = (s == np.min(s))
+            wj = (V.conj()[mm, :].sum(axis=0) / np.sqrt(mm.sum())).astype(dtype)
+        else:
+            V = scipy.linalg.null_space(
+                A_block[mask, :m_plus_one], check_finite=False
+            )
+            nm = V.shape[-1]
+            wj = V.sum(axis=-1) / np.sqrt(nm)
+
+        i0 = (wj != 0)
+        with np.errstate(invalid="ignore"):
+            N = C_block[:, :m_plus_one][:, i0] @ (wj[i0] * fj[:m_plus_one][i0])
+            D = C_block[:, :m_plus_one][:, i0] @ wj[i0]
+
+        D_inf = np.isinf(D) | np.isnan(D)
+        D[D_inf] = 1
+        N[D_inf] = f[D_inf]
+        R = N / D
+
+        max_error = np.linalg.norm(f - R, ord=np.inf)
+        support_points = zj[:m_plus_one][i0]
+        support_values = fj[:m_plus_one][i0]
+        weights = wj[i0]
+        poles = self._compute_poles_from_weights(support_points, weights)
+        boundary_values = self._evaluate_barycentric(
+            boundary_points, support_points, support_values, weights
+        )
+        boundary_max = np.linalg.norm(boundary_values, ord=np.inf)
+        return wj, R, max_error, poles, boundary_max
+
 
 class FloaterHormannInterpolator(_BarycentricRational):
     r"""
